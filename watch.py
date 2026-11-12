@@ -9,13 +9,14 @@ hlásí jen to, co přibylo od minule.
 """
 
 import argparse
+import http.client
 import json
 import os
 import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 SITE_ID = "10101"  # cinemacity.cz
@@ -33,6 +34,8 @@ HORIZON_DAYS = int(os.environ.get("HORIZON_DAYS", "180"))
 # IMAX sály. Doplňuje (nenahrazuje) sondu podle názvu sálu.
 HINT_ATTR = os.environ.get("HINT_ATTR", "70-mm")
 DELAY = float(os.environ.get("REQUEST_DELAY", "0.25"))
+
+API_ATTEMPTS = 4
 
 CZ_DAYS = ["po", "út", "st", "čt", "pá", "so", "ne"]
 
@@ -52,19 +55,23 @@ def api(path):
     """GET na data-api-service; vrací obsah klíče "body"."""
     url = f"{BASE}{path}"
     last = None
-    for attempt in range(4):
+    for attempt in range(API_ATTEMPTS):
+        if attempt:
+            time.sleep(2 ** (attempt - 1))
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8"))["body"]
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        # OSError covers URLError/HTTPError, timeouts and a connection reset
+        # mid-read; HTTPException a truncated response (IncompleteRead); KeyError
+        # and ValueError a response that is not the expected JSON with a "body" key.
+        except (OSError, http.client.HTTPException, ValueError, KeyError) as exc:
             last = exc
-            time.sleep(2 ** attempt)
-    raise SystemExit(f"API selhalo po 4 pokusech: {url}\n{last}")
+    raise SystemExit(f"API selhalo po {API_ATTEMPTS} pokusech: {url}\n{last!r}")
 
 
 def horizon():
-    return (date.today() + timedelta(days=HORIZON_DAYS)).isoformat()
+    return (now().date() + timedelta(days=HORIZON_DAYS)).isoformat()
 
 
 def fetch_cinemas():
@@ -198,6 +205,13 @@ def fmt_short(iso):
 def render(new_events, gone_events):
     """Markdown tělo hlášení."""
     lines = []
+    # With an empty FILM_PATTERN every film in the auditorium is watched. Once
+    # a report covers more than one, each showing must say which film it is.
+    several = len(film_names(list(new_events) + list(gone_events))) > 1
+
+    def film_prefix(e):
+        return f"{e['film']} · " if several else ""
+
     if new_events:
         lines.append(f"### Nově vypsáno ({len(new_events)})\n")
         for cinema, group in group_by_cinema(new_events):
@@ -214,21 +228,23 @@ def render(new_events, gone_events):
                     flags.append("**vyprodáno**")
                 suffix = f" — {', '.join(flags)}" if flags else ""
                 link = f" — [koupit]({e['booking']})" if e["booking"] else ""
-                lines.append(f"- {fmt_dt(e['datetime'])} · {e['auditorium']}{suffix}{link}")
+                lines.append(f"- {film_prefix(e)}{fmt_dt(e['datetime'])} · {e['auditorium']}{suffix}{link}")
             lines.append("")
     if gone_events:
         lines.append(f"### Zmizelo z rozpisu ({len(gone_events)})\n")
         for cinema, group in group_by_cinema(gone_events):
             lines.append(f"**{cinema}**\n")
             for e in group:
-                lines.append(f"- {fmt_dt(e['datetime'])} · {e['auditorium']}")
+                lines.append(f"- {film_prefix(e)}{fmt_dt(e['datetime'])} · {e['auditorium']}")
             lines.append("")
-    film_link = next(
-        (e["filmLink"] for e in list(new_events) + list(gone_events) if e.get("filmLink")),
-        None,
-    )
-    if film_link:
-        lines.append(f"[Stránka filmu na Cinema City]({film_link})")
+    film_links = {}
+    for e in list(new_events) + list(gone_events):
+        if e.get("filmLink"):
+            film_links.setdefault(e["film"], e["filmLink"])
+    if len(film_links) == 1:
+        lines.append(f"[Stránka filmu na Cinema City]({next(iter(film_links.values()))})")
+    else:
+        lines.extend(f"- [{name} na Cinema City]({link})" for name, link in film_links.items())
     lines.append("")
     lines.append(
         f"<sub>Zkontrolováno {now():%d. %m. %Y %H:%M} · "
@@ -244,8 +260,21 @@ def group_by_cinema(events):
     return order.items()
 
 
+def film_names(events):
+    """Film names in order of first appearance, without duplicates."""
+    return list(dict.fromkeys(e["film"] for e in events))
+
+
+def film_label(events):
+    """One film by name, several by count: the title must not claim only the first one is affected."""
+    names = film_names(events)
+    if len(names) == 1:
+        return names[0]
+    return f"{names[0]} a {len(names) - 1} další" if len(names) < 6 else f"{len(names)} filmů"
+
+
 def title_for(new_events):
-    film = new_events[0]["film"]
+    film = film_label(new_events)
     days = sorted({e["datetime"][:10] for e in new_events})
     span = fmt_short(days[0])
     if len(days) > 1:
@@ -310,7 +339,7 @@ def main():
     if new_events:
         title = title_for(new_events)
     else:
-        film = gone[0]["film"]
+        film = film_label(gone)
         title = f"🎬 {film} v IMAXu: zrušené termíny"
     with open(args.report, "w", encoding="utf-8") as fh:
         fh.write(body + "\n")
